@@ -1,5 +1,6 @@
 #if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include "moe_mul1.h"
+#include "../nap_pace.h"
 #include <c10/util/Half.h>
 #include <torch/extension.h>
 
@@ -2978,6 +2979,7 @@ struct Pool
     void worker_loop(int idx, uint64_t seen)
     {
         pin_self(idx);
+        exl3_pace::apply_timer_slack();   // this thread naps, see nap_pace.h
         int idle = 0;
         std::chrono::steady_clock::time_point idle_since{};
         while (true) {
@@ -2992,16 +2994,11 @@ struct Pool
                 // Matches the outer job-ring poll's threshold (moe_handoff.cu)
                 if (++idle < 65536) { cpu_pause(); continue; }
 #ifdef __linux__
-                {
-                    // Nap length by time idle, so the wake penalty stays a small fraction of any gap: a decode step
-                    // with a long GPU-only window keeps 100 us naps, 10 ms naps only after seconds between requests
-                    if (idle == 65536) idle_since = std::chrono::steady_clock::now();
-                    const auto idle_for = std::chrono::steady_clock::now() - idle_since;
-                    if (idle_for < std::chrono::milliseconds(100)) std::this_thread::sleep_for(std::chrono::microseconds(100));
-                    else if (idle_for < std::chrono::seconds(2)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    else std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    idle = 65536 + 1;
-                }
+                // Ladder naps (nap_pace.h): tier 1 while a pass is live, 1 ms/10 ms only after a
+                // continuous 100 ms / 2 s dry spell, which a live pass cannot accumulate
+                if (idle == 65536) idle_since = std::chrono::steady_clock::now();
+                exl3_pace::nap(idle_since);
+                idle = 65536 + 1;
 #else
                 // Never a timed nap here: Windows rounds short sleeps up to the timer quantum
                 // (default 15.6 ms), and the run() barrier turns one late waker into everyone

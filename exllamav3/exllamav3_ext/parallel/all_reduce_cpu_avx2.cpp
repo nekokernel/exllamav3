@@ -5,6 +5,7 @@
 #include "../avx2_target.h"
 #include "../avx512_target.h"
 #include "../util.h"
+#include "../nap_pace.h"
 #include <thread>
 #include <cstring>
 #include <atomic>
@@ -16,9 +17,9 @@
 
 // ---------------------------------------------------------------------------------------------
 // Worker pool for sliced accumulates. Workers are spawned lazily in the CPU-reduce process,
-// spin-park between generations (pause loop backing off to 50 us naps) and each executes its
-// own task slot when the generation counter bumps. Only one reduce runs at a time, so a single
-// generation/done pair suffices.
+// spin-park between generations (pause loop backing off to the exl3_pace ladder, see nap_pace.h)
+// and each executes its own task slot when the generation counter bumps. Only one reduce runs at a
+// time, so a single generation/done pair suffices.
 
 #define CPUREDUCE_MAX_WORKERS 3
 
@@ -40,6 +41,7 @@ static std::atomic<int> g_slice_workers{0};
 static void slice_worker(int idx)
 {
     enable_fast_fp();  // MXCSR is per-thread
+    exl3_pace::apply_timer_slack();   // this thread naps, see nap_pace.h
     uint64_t seen = 0;
     int idle = 0;
     std::chrono::steady_clock::time_point idle_since{};
@@ -53,16 +55,12 @@ static void slice_worker(int idx)
                 _mm_pause();
                 continue;
             }
-                {
-                // Nap length by time idle, so the wake penalty stays a small fraction of any gap: a decode step
-                // with a long GPU-only window keeps 100 us naps, 10 ms naps only after seconds between requests
-                if (idle == 8192) idle_since = std::chrono::steady_clock::now();
-                const auto idle_for = std::chrono::steady_clock::now() - idle_since;
-                if (idle_for < std::chrono::milliseconds(100)) std::this_thread::sleep_for(std::chrono::microseconds(100));
-                else if (idle_for < std::chrono::seconds(2)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                else std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                idle = 8192 + 1;
-            }
+            // Ladder naps (nap_pace.h). This pool's spin budget is 8x shorter than the MoE one
+            // (~0.11 ms vs ~0.9 ms), so during a pass these workers reach tier 1 naps on nearly every
+            // layer: there, the tier 1 length is simply the per-all-reduce wake latency.
+            if (idle == 8192) idle_since = std::chrono::steady_clock::now();
+            exl3_pace::nap(idle_since);
+            idle = 8192 + 1;
             continue;
         }
         idle = 0;

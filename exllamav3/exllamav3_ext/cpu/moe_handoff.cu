@@ -1,5 +1,6 @@
 #include "moe_handoff.h"
 #include "moe_mul1.h"
+#include "../nap_pace.h"
 #include "../routing.cuh"
 
 #include <c10/cuda/CUDAGuard.h>
@@ -365,6 +366,7 @@ void exl3_moe_cpu_worker_run
 )
 {
     // GIL is released by the binding's call_guard; do not release it again here
+    exl3_pace::apply_timer_slack();   // this thread naps, see nap_pace.h
     uint8_t* base = reinterpret_cast<uint8_t*>(shm_base);
     uint32_t* quit = reinterpret_cast<uint32_t*>(base + 0);
     uint32_t* pass_wake = reinterpret_cast<uint32_t*>(base + 64);
@@ -388,6 +390,7 @@ void exl3_moe_cpu_worker_run
     int stage_threads_ = stage_threads > 0 ? (int) stage_threads : 1;
     std::thread stager([&]()
     {
+        exl3_pace::apply_timer_slack();   // this thread naps, see nap_pace.h
         uint32_t shead = load_acquire_u32(stage_head);
         uint32_t s_last_wake = 0;
         int s_idle = 0;
@@ -400,16 +403,11 @@ void exl3_moe_cpu_worker_run
             if (load_acquire_u32(stage_tail) == shead)
             {
                 if (++s_idle < 65536) { cpu_pause_(); continue; }
-                {
-                    // Nap length by time idle, so the wake penalty stays a small fraction of any gap: a decode step
-                    // with a long GPU-only window keeps 100 us naps, 10 ms naps only after seconds between requests
-                    if (s_idle == 65536) s_idle_since = std::chrono::steady_clock::now();
-                    const auto idle_for = std::chrono::steady_clock::now() - s_idle_since;
-                    if (idle_for < std::chrono::milliseconds(100)) std::this_thread::sleep_for(std::chrono::microseconds(100));
-                    else if (idle_for < std::chrono::seconds(2)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    else std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    s_idle = 65536 + 1;
-                }
+                // Ladder naps (nap_pace.h): tier 1 while a pass is live, 1 ms/10 ms only after a
+                // continuous 100 ms / 2 s dry spell, which a live pass cannot accumulate
+                if (s_idle == 65536) s_idle_since = std::chrono::steady_clock::now();
+                exl3_pace::nap(s_idle_since);
+                s_idle = 65536 + 1;
                 continue;
             }
             s_idle = 0;
@@ -474,18 +472,12 @@ void exl3_moe_cpu_worker_run
         if (load_acquire_u32(jobs_tail) == head)
         {
             // Spin hard in-pass (jobs arrive within microseconds of the GPU reaching the layer),
-            // back off to two-tier naps (100us for first ~50ms, then 10ms between prompts)
+            // then nap on the ladder (nap_pace.h): tier 1 while a pass is live, 1 ms/10 ms only after
+            // a continuous 100 ms / 2 s dry spell, i.e. between requests
             if (++idle < 65536) { cpu_pause_(); continue; }
-                {
-                // Nap length by time idle, so the wake penalty stays a small fraction of any gap: a decode step
-                // with a long GPU-only window keeps 100 us naps, 10 ms naps only after seconds between requests
-                if (idle == 65536) idle_since = std::chrono::steady_clock::now();
-                const auto idle_for = std::chrono::steady_clock::now() - idle_since;
-                if (idle_for < std::chrono::milliseconds(100)) std::this_thread::sleep_for(std::chrono::microseconds(100));
-                else if (idle_for < std::chrono::seconds(2)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                else std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                idle = 65536 + 1;
-            }
+            if (idle == 65536) idle_since = std::chrono::steady_clock::now();
+            exl3_pace::nap(idle_since);
+            idle = 65536 + 1;
             continue;
         }
         idle = 0;
